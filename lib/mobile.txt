@@ -1,0 +1,762 @@
+================================================================================
+FILE: app/app.dart  (size: 326 bytes)
+================================================================================
+import 'package:flutter/material.dart';
+import 'router.dart';
+
+class App extends StatelessWidget {
+  const App({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Health Patient',
+      onGenerateRoute: appOnGenerateRoute,
+      initialRoute: '/',
+    );
+  }
+}
+
+================================================================================
+FILE: app/router.dart  (size: 940 bytes)
+================================================================================
+import 'package:flutter/material.dart';
+import '../features/auth/presentation/login_page.dart';
+import '../features/auth/presentation/activate_page.dart';
+import '../features/scoring/presentation/score_page.dart';
+import '../features/scoring/presentation/result_page.dart';
+
+Route<dynamic>? appOnGenerateRoute(RouteSettings settings) {
+  switch (settings.name) {
+    case '/':
+      return MaterialPageRoute(builder: (_) => const LoginPage());
+    case '/activate':
+      return MaterialPageRoute(builder: (_) => const ActivatePage());
+    case '/score':
+      return MaterialPageRoute(builder: (_) => const ScorePage());
+    case '/score/result':
+      final data = (settings.arguments as Map<String, dynamic>?) ?? const {};
+      return MaterialPageRoute(builder: (_) => ResultPage(result: data));
+    default:
+      return MaterialPageRoute(
+        builder: (_) => const Scaffold(body: Center(child: Text('Not found'))),
+      );
+  }
+}
+
+================================================================================
+FILE: collect_text_and_tree.py  (size: 9494 bytes)
+================================================================================
+#!/usr/bin/env python3
+"""
+Collect project sources:
+- For text files: write full contents (preserved exactly).
+- For non-text files: write only the file name (marked as UNSUPPORTED/BINARY).
+- Finally, append an ASCII tree of the entire project.
+
+Defaults: excludes heavy build/dependency folders (.next, node_modules) and lockfiles (package-lock.json);
+includes hidden files; deterministic order.
+You can pass --exclude to skip additional directories/files by name, and --followlinks to follow symlinks.
+"""
+
+from __future__ import annotations
+import argparse
+import os
+from pathlib import Path
+import sys
+import tokenize
+import mimetypes
+
+HEADER_LINE = "=" * 80
+
+# Common text-like extensions (still fallback to detection)
+TEXT_EXTS = {
+    # Code
+    ".java", ".kt", ".kts",
+    ".js", ".ts", ".jsx", ".tsx",
+    ".css", ".scss", ".sass", ".less",
+    ".html", ".htm", ".vue", ".svelte",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".m", ".mm",
+    ".go", ".rs", ".php", ".rb", ".swift", ".scala",
+    ".cs", ".sql", ".sh", ".bat", ".ps1",".py",".dart",
+    # Config / data / docs
+    ".json", ".yaml", ".yml", ".xml", ".ini", ".cfg", ".conf", ".properties",
+    ".toml", ".gradle", ".md", ".txt", ".env", ".csv", ".tsv",
+    ".gitignore", ".gitattributes", ".editorconfig", ".prettierrc", ".eslintrc",
+}
+
+# MIME types we treat as text even if extension is unknown
+TEXT_MIME_PREFIXES = ("text/",)
+TEXT_MIME_EXTRAS = {
+    "application/json", "application/xml", "application/javascript",
+    "application/x-sh", "application/x-shellscript",
+}
+
+# Default names to skip while walking/printing the tree (directories or files)
+DEFAULT_EXCLUDES = {".next", "node_modules", ".idea", ".venv", "package-lock.json"}
+
+# ---------- Helpers ----------
+
+def _has_bom(head: bytes) -> str | None:
+    if head.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if head.startswith(b"\xff\xfe\x00\x00"):
+        return "utf-32-le"
+    if head.startswith(b"\x00\x00\xfe\xff"):
+        return "utf-32-be"
+    if head.startswith(b"\xff\xfe"):
+        return "utf-16-le"
+    if head.startswith(b"\xfe\xff"):
+        return "utf-16-be"
+    return None
+
+def _looks_binary(head: bytes) -> bool:
+    if b"\x00" in head:
+        return True
+    # Consider control chars (excluding \t, \n, \r, \f) as "weird"
+    weird = sum(1 for b in head if (b < 32 and b not in (9, 10, 13, 12)))
+    # If > 30% are weird control bytes, likely binary
+    return (len(head) > 0) and (weird / len(head) > 0.30)
+
+def is_text_file(path: Path, sample_bytes: int = 4096) -> bool:
+    # 1) Obvious by extension
+    if path.suffix.lower() in TEXT_EXTS:
+        return True
+    # 2) BOM presence indicates text
+    try:
+        with path.open("rb") as f:
+            head = f.read(sample_bytes)
+    except Exception:
+        return False
+    if _has_bom(head):
+        return True
+    # 3) MIME hint
+    mt, _ = mimetypes.guess_type(path.as_posix())
+    if mt and (mt.startswith(TEXT_MIME_PREFIXES) or mt in TEXT_MIME_EXTRAS):
+        return True
+    # 4) Heuristic on bytes
+    return not _looks_binary(head)
+
+def read_text_preserve(path: Path) -> str:
+    """Read text preserving original characters as closely as possible."""
+    # Respect PEP 263 for Python files
+    if path.suffix.lower() == ".py":
+        with tokenize.open(path) as f:
+            return f.read()
+    # BOM-aware for common Unicode encodings
+    with path.open("rb") as fb:
+        head = fb.read(4)
+    enc = _has_bom(head)
+    if enc:
+        return path.read_text(encoding=enc)
+    # Try UTF-8, then Latin-1 (lossless mapping of bytes 0–255)
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="latin-1")
+
+def write_header(out, rel_path: Path, size_bytes: int | None, marker: str | None = None):
+    out.write(f"{HEADER_LINE}\n")
+    out.write(f"FILE: {rel_path.as_posix()}")
+    if size_bytes is not None:
+        out.write(f"  (size: {size_bytes} bytes)")
+    if marker:
+        out.write(f"  [{marker}]")
+    out.write("\n")
+    out.write(f"{HEADER_LINE}\n")
+
+def iter_all_files(root: Path, followlinks: bool, exclude_names: set[str]) -> list[Path]:
+    """
+    Walk the tree and return all file paths, skipping any directory whose *name*
+    is in exclude_names, and skipping any file whose *name* is in exclude_names.
+    """
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=followlinks):
+        # prune directories by name
+        if exclude_names:
+            dirnames[:] = [d for d in dirnames if d not in exclude_names]
+        # skip files by name (e.g., 'package-lock.json')
+        for fn in filenames:
+            if fn in exclude_names:
+                continue
+            files.append(Path(dirpath) / fn)
+    files.sort(key=lambda p: p.as_posix().lower())
+    return files
+
+def tree_lines(root: Path, exclude_names: set[str], followlinks: bool) -> list[str]:
+    """Produce an ASCII tree (dirs then files, sorted), excluding entries by name."""
+    lines: list[str] = [f"{root.name}/"]
+    def walk(d: Path, prefix: str):
+        try:
+            entries = sorted(
+                [e for e in d.iterdir() if e.name not in exclude_names],
+                key=lambda p: (not p.is_dir(), p.name.lower())
+            )
+        except PermissionError:
+            return
+        for i, e in enumerate(entries):
+            last = (i == len(entries) - 1)
+            conn = "└── " if last else "├── "
+            if e.is_dir():
+                lines.append(f"{prefix}{conn}{e.name}/")
+                walk(e, prefix + ("    " if last else "│   "))
+            else:
+                lines.append(f"{prefix}{conn}{e.name}")
+    walk(root, "")
+    return lines
+
+# ---------- Main logic ----------
+
+def collect(root: Path, out_path: Path, followlinks: bool, exclude_names: set[str]) -> int:
+    root = root.resolve()
+    out_path = out_path.resolve()
+
+    if not root.exists() or not root.is_dir():
+        print(f"Error: root '{root}' is not a directory.", file=sys.stderr)
+        return 2
+
+    files = iter_all_files(root, followlinks, exclude_names)
+    if not files:
+        print("No files found.", file=sys.stderr)
+        return 1
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    text_count = 0
+    bin_count = 0
+
+    with out_path.open("w", encoding="utf-8", newline="\n") as out:
+        for f in files:
+            # Don't include the output file itself
+            try:
+                if f.resolve() == out_path:
+                    continue
+            except Exception:
+                pass
+
+            rel = f.relative_to(root)
+            try:
+                size_bytes = f.stat().st_size
+            except Exception:
+                size_bytes = None
+
+            try:
+                if is_text_file(f):
+                    content = read_text_preserve(f)
+                    write_header(out, rel, size_bytes)
+                    out.write(content)
+                    if not content.endswith("\n"):
+                        out.write("\n")
+                    out.write("\n")
+                    text_count += 1
+                else:
+                    write_header(out, rel, size_bytes, marker="UNSUPPORTED/NON-TEXT")
+                    out.write("(contents omitted)\n\n")
+                    bin_count += 1
+            except Exception as e:
+                write_header(out, rel, size_bytes, marker="READ_ERROR")
+                out.write(f"[ERROR] {e}\n\n")
+                bin_count += 1
+
+        # ---- Append project tree ----
+        out.write(f"{HEADER_LINE}\nPROJECT TREE\n{HEADER_LINE}\n")
+        for line in tree_lines(root, exclude_names, followlinks):
+            out.write(line + "\n")
+
+        # ---- Summary ----
+        out.write("\n")
+        out.write(f"{HEADER_LINE}\nSUMMARY\n{HEADER_LINE}\n")
+        out.write(f"Text files written : {text_count}\n")
+        out.write(f"Non-text/omitted   : {bin_count}\n")
+        out.write(f"Total files seen   : {len(files)}\n")
+
+    print(f"Done. Text={text_count}  Non-text={bin_count}  Wrote -> '{out_path}'.")
+    return 0
+
+def parse_excludes(argv_excludes: list[str]) -> set[str]:
+    """
+    Accept bare names (directories or files) to exclude while walking and when printing the tree.
+    Always include defaults (.next, node_modules, .idea, .venv, package-lock.json), while allowing users to add more.
+    """
+    return DEFAULT_EXCLUDES.union(set(argv_excludes or []))
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Write all text files, list non-text files, then append project tree."
+    )
+    ap.add_argument("root", type=Path, help="Root directory to scan")
+    ap.add_argument("output", type=Path, help="Output .txt file")
+    ap.add_argument(
+        "--exclude",
+        nargs="*",
+        default=[],
+        help="Extra directory/file names to exclude in addition to defaults (space-separated)"
+    )
+    ap.add_argument("--followlinks", action="store_true", help="Follow symlinked directories")
+    args = ap.parse_args()
+
+    exclude_names = parse_excludes(args.exclude)
+    rc = collect(args.root, args.output, followlinks=args.followlinks, exclude_names=exclude_names)
+    sys.exit(rc)
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: core/api.dart  (size: 583 bytes)
+================================================================================
+import 'package:dio/dio.dart';
+import 'env.dart';
+import 'storage.dart';
+
+final Dio dio = Dio(
+  BaseOptions(
+    baseUrl: Env.backend,
+    connectTimeout: const Duration(seconds: 10),
+    receiveTimeout: const Duration(seconds: 15),
+    headers: {'Content-Type': 'application/json'},
+  ),
+)..interceptors.add(
+  InterceptorsWrapper(
+    onRequest: (options, handler) async {
+      final token = await AppStorage.readJwt();
+      if (token != null && token.isNotEmpty) {
+        options.headers['Authorization'] = 'Bearer $token';
+      }
+      handler.next(options);
+    },
+  ),
+);
+
+================================================================================
+FILE: core/env.dart  (size: 120 bytes)
+================================================================================
+class Env {
+  static const backend =
+  String.fromEnvironment('BACKEND_URL', defaultValue: 'http://10.0.2.2:4000');
+}
+
+================================================================================
+FILE: core/storage.dart  (size: 677 bytes)
+================================================================================
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+class AppStorage {
+  static const _storage = FlutterSecureStorage();
+  static const _jwtKey = 'jwt';
+  static const _refreshKey = 'refresh';
+
+  static Future<void> saveTokens(String access, String refresh) async {
+    await _storage.write(key: _jwtKey, value: access);
+    await _storage.write(key: _refreshKey, value: refresh);
+  }
+
+  static Future<String?> readJwt() => _storage.read(key: _jwtKey);
+  static Future<String?> readRefresh() => _storage.read(key: _refreshKey);
+
+  static Future<void> clear() async {
+    await _storage.delete(key: _jwtKey);
+    await _storage.delete(key: _refreshKey);
+  }
+}
+
+================================================================================
+FILE: features/auth/application/auth_controller.dart  (size: 300 bytes)
+================================================================================
+import '../../auth/data/auth_service.dart';
+
+class AuthController {
+  final AuthService _svc;
+  AuthController([AuthService? svc]) : _svc = svc ?? AuthService();
+
+  Future<void> login(String email, String password) => _svc.login(email, password);
+  Future<void> logout() => _svc.logout();
+}
+
+================================================================================
+FILE: features/auth/data/auth_service.dart  (size: 1283 bytes)
+================================================================================
+import 'package:dio/dio.dart';
+import '../../../core/api.dart';
+import '../../../core/storage.dart';
+
+class AuthService {
+  Future<Map<String, dynamic>> login(String email, String password) async {
+    final res = await dio.post('/auth/login', data: {'email': email, 'password': password});
+    final data = res.data as Map<String, dynamic>;
+    await AppStorage.saveTokens(data['accessToken'], data['refreshToken']);
+    return data;
+  }
+
+  Future<void> activate(String token, String password) async {
+    final res = await dio.post('/auth/activate', data: {'token': token, 'password': password});
+    final data = res.data as Map<String, dynamic>;
+    await AppStorage.saveTokens(data['accessToken'], data['refreshToken']);
+  }
+
+  Future<String?> refresh() async {
+    final rt = await AppStorage.readRefresh();
+    if (rt == null) return null;
+    try {
+      final res = await dio.post('/auth/refresh', data: {'refreshToken': rt});
+      final at = (res.data as Map<String, dynamic>)['accessToken'] as String;
+      await AppStorage.saveTokens(at, rt);
+      return at;
+    } on DioException {
+      await AppStorage.clear();
+      rethrow;
+    }
+  }
+
+  Future<void> logout() async {
+    await AppStorage.clear();
+  }
+
+  Future<String?> currentToken() => AppStorage.readJwt();
+}
+
+================================================================================
+FILE: features/auth/presentation/activate_page.dart  (size: 2851 bytes)
+================================================================================
+import 'package:dio/dio.dart';
+import 'package:flutter/material.dart';
+import '../../auth/data/auth_service.dart';
+
+class ActivatePage extends StatefulWidget {
+  const ActivatePage({super.key});
+  @override
+  State<ActivatePage> createState() => _ActivatePageState();
+}
+
+class _ActivatePageState extends State<ActivatePage> {
+  final _formKey = GlobalKey<FormState>();
+  final _token = TextEditingController();
+  final _pass = TextEditingController();
+  bool _loading = false;
+  String? _msg;
+  final _auth = AuthService();
+
+  @override
+  void dispose() {
+    _token.dispose();
+    _pass.dispose();
+    super.dispose();
+  }
+
+  Future<void> _onActivate() async {
+    if (!_formKey.currentState!.validate()) return;
+    setState(() { _loading = true; _msg = null; });
+    try {
+      await _auth.activate(_token.text.trim(), _pass.text);
+      if (!mounted) return;
+      Navigator.of(context).pushReplacementNamed('/score');
+    } on DioException catch (e) {
+      setState(() => _msg = e.response?.data?['error'] ?? 'Activation failed');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Activate Account')),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 480),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Form(
+              key: _formKey,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_msg != null) Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Text(_msg!, style: const TextStyle(color: Colors.red)),
+                  ),
+                  TextFormField(
+                    controller: _token,
+                    decoration: const InputDecoration(labelText: 'Invite token'),
+                    validator: (v) => (v==null || v.isEmpty) ? 'Required' : null,
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _pass,
+                    obscureText: true,
+                    decoration: const InputDecoration(labelText: 'New password'),
+                    validator: (v) => (v==null || v.length<6) ? 'Min 6 chars' : null,
+                  ),
+                  const SizedBox(height: 16),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton(
+                      onPressed: _loading ? null : _onActivate,
+                      child: Text(_loading ? 'Activating...' : 'Activate'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+================================================================================
+FILE: features/auth/presentation/login_page.dart  (size: 3059 bytes)
+================================================================================
+import 'package:dio/dio.dart';
+import 'package:flutter/material.dart';
+import '../../auth/data/auth_service.dart';
+
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key});
+  @override
+  State<LoginPage> createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  final _formKey = GlobalKey<FormState>();
+  final _email = TextEditingController();
+  final _pass = TextEditingController();
+  bool _loading = false;
+  String? _msg;
+
+  final _auth = AuthService();
+
+  @override
+  void dispose() {
+    _email.dispose();
+    _pass.dispose();
+    super.dispose();
+  }
+
+  Future<void> _onLogin() async {
+    if (!_formKey.currentState!.validate()) return;
+    setState(() { _loading = true; _msg = null; });
+    try {
+      await _auth.login(_email.text.trim(), _pass.text);
+      if (!mounted) return;
+      Navigator.of(context).pushReplacementNamed('/score');
+    } on DioException catch (e) {
+      setState(() => _msg = e.response?.data?['error'] ?? 'Login failed');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Patient Login')),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 480),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Form(
+              key: _formKey,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_msg != null) Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Text(_msg!, style: const TextStyle(color: Colors.red)),
+                  ),
+                  TextFormField(
+                    controller: _email,
+                    decoration: const InputDecoration(labelText: 'Email'),
+                    validator: (v) => (v==null || v.isEmpty) ? 'Required' : null,
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _pass,
+                    obscureText: true,
+                    decoration: const InputDecoration(labelText: 'Password'),
+                    validator: (v) => (v==null || v.length<6) ? 'Min 6 chars' : null,
+                  ),
+                  const SizedBox(height: 16),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton(
+                      onPressed: _loading ? null : _onLogin,
+                      child: Text(_loading ? 'Signing in...' : 'Sign in'),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pushNamed('/activate'),
+                    child: const Text('Have an invite? Activate account'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+================================================================================
+FILE: features/scoring/data/score_service.dart  (size: 417 bytes)
+================================================================================
+import '../../../core/api.dart';
+
+class ScoreService {
+  Future<String> enqueue(String patientId) async {
+    final res = await dio.post('/jobs/score-now', data: {'patient_id': patientId});
+    return res.data['jobId'].toString();
+  }
+
+  Future<Map<String, dynamic>> status(String jobId) async {
+    final res = await dio.get('/jobs/$jobId');
+    return Map<String, dynamic>.from(res.data as Map);
+  }
+}
+
+================================================================================
+FILE: features/scoring/presentation/result_page.dart  (size: 1274 bytes)
+================================================================================
+import 'package:flutter/material.dart';
+
+class ResultPage extends StatelessWidget {
+  final Map<String, dynamic> result;
+  const ResultPage({super.key, required this.result});
+
+  @override
+  Widget build(BuildContext context) {
+    final band = result['band']?.toString() ?? '-';
+    final score = result['score']?.toString() ?? '-';
+    final reasons = (result['reasons'] as List?)?.join(', ') ?? '-';
+    final model = result['model_version']?.toString() ?? '-';
+    return Scaffold(
+      appBar: AppBar(title: const Text('Score Result')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Band: $band', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Text('Score: $score'),
+              const SizedBox(height: 8),
+              Text('Reasons: $reasons'),
+              const Divider(height: 24),
+              Text('Model: $model', style: const TextStyle(fontStyle: FontStyle.italic)),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+================================================================================
+FILE: features/scoring/presentation/score_page.dart  (size: 1802 bytes)
+================================================================================
+import 'dart:async';
+import 'package:flutter/material.dart';
+import '../../scoring/data/score_service.dart';
+
+class ScorePage extends StatefulWidget {
+  const ScorePage({super.key});
+  @override State<ScorePage> createState() => _ScorePageState();
+}
+
+class _ScorePageState extends State<ScorePage> {
+  final _svc = ScoreService();
+  String? _jobId;
+  Map<String, dynamic>? _result;
+  Timer? _poll;
+
+  Future<void> _enqueue() async {
+    final id = await _svc.enqueue('demo');
+    setState(() { _jobId = id; _result = null; });
+    _poll?.cancel();
+    _poll = Timer.periodic(const Duration(seconds: 1), (_) => _check());
+  }
+
+  Future<void> _check() async {
+    if (_jobId == null) return;
+    final info = await _svc.status(_jobId!);
+    final state = info['state'] as String?;
+    if (state == 'completed') {
+      _poll?.cancel();
+      final res = info['returnvalue'] as Map<String, dynamic>?;
+      if (!mounted) return;
+      Navigator.pushNamed(context, '/score/result', arguments: res ?? const {});
+    }
+    if (state == 'failed') {
+      _poll?.cancel();
+      setState(() { _result = {'error': info['failedReason']}; });
+    }
+  }
+
+  @override void dispose() { _poll?.cancel(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Risk Score')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(children: [
+          FilledButton(onPressed: _enqueue, child: const Text('Enqueue demo scoring job')),
+          const SizedBox(height: 16),
+          if (_jobId != null) Text('Job: $_jobId'),
+          const SizedBox(height: 16),
+          if (_result != null) Text('Result: $_result'),
+        ]),
+      ),
+    );
+  }
+}
+
+================================================================================
+FILE: main.dart  (size: 104 bytes)
+================================================================================
+import 'package:flutter/material.dart';
+import 'app/app.dart';
+
+void main() => runApp(const App());
+
+================================================================================
+PROJECT TREE
+================================================================================
+lib/
+├── app/
+│   ├── app.dart
+│   └── router.dart
+├── core/
+│   ├── api.dart
+│   ├── env.dart
+│   └── storage.dart
+├── features/
+│   ├── auth/
+│   │   ├── application/
+│   │   │   └── auth_controller.dart
+│   │   ├── data/
+│   │   │   └── auth_service.dart
+│   │   └── presentation/
+│   │       ├── activate_page.dart
+│   │       └── login_page.dart
+│   └── scoring/
+│       ├── data/
+│       │   └── score_service.dart
+│       └── presentation/
+│           ├── result_page.dart
+│           └── score_page.dart
+├── collect_text_and_tree.py
+├── main.dart
+└── mobile.txt
+
+================================================================================
+SUMMARY
+================================================================================
+Text files written : 14
+Non-text/omitted   : 0
+Total files seen   : 14
